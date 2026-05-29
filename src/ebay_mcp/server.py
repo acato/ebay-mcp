@@ -7,6 +7,7 @@ tools (search, watchlist, bidding, etc.) land in Day 1b onward.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -22,6 +23,20 @@ mcp = FastMCP("ebay-mcp")
 # Hard caps that keep individual tool responses tractable for the LLM.
 SEARCH_LIMIT_MAX = 200
 DEFAULT_SEARCH_LIMIT = 20
+
+# Money-commit safety gates. Bids/buys/offers above MONEY_CAP refuse with a
+# structured payload unless the caller passes `max_bid_override >= amount`
+# OR the operator has set HIGH_VALUE_OVERRIDE_ENV=1 in the environment.
+# Tuned conservatively — the typical eBay-MCP workflow is sub-$100 watchlist
+# bidding; anything beyond $500 should require explicit human ratification.
+MONEY_CAP = 500.0
+HIGH_VALUE_OVERRIDE_ENV = "EBAY_MCP_ALLOW_HIGH_VALUE"
+
+# Trading PlaceOffer wants an EndUserIP; eBay does not validate it under the
+# IAF token flow, but the field is required. A loopback constant is the
+# least misleading placeholder for a non-browser caller.
+PLACE_OFFER_END_USER_IP = "127.0.0.1"
+DEFAULT_CURRENCY = "USD"
 
 # Map LLM-facing sort names → eBay Browse API sort parameter values.
 _SORT_MAP: dict[str, str | None] = {
@@ -91,9 +106,6 @@ def list_hosts() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for name in sorted(cfg.hosts.keys()):
         host = cfg.hosts[name]
-        # Check cert availability without raising
-        import os
-
         env_var = f"EBAY_MCP_{name.upper()}_CERT_ID"
         cert_in_env = bool(os.environ.get(env_var))
         cert_in_file = bool(host.cert_id)
@@ -696,6 +708,348 @@ def complete_user_auth(
     cfg = _config()
     resolved_host = cfg.resolve_host(host)
     return auth.complete_user_auth(cfg, resolved_host, code, state=state)
+
+
+def _check_money_gate(
+    *,
+    tool: str,
+    item_id: str,
+    amount: float,
+    confirm_amount: float,
+    max_bid_override: float | None,
+    host: str,
+) -> dict[str, Any] | None:
+    """Run the shared safety stack for money-commit tools.
+
+    Returns a structured refusal payload (which the calling tool returns
+    directly to the LLM) when a safety gate trips, or None to clear the
+    call for execution. Refusals are payloads — not exceptions — so the
+    LLM can read the explanation and retry with corrected parameters.
+
+    Gates, in order:
+      1. ``confirm_amount`` must equal ``amount`` exactly. The LLM is
+         expected to repeat the dollar amount; the gate proves it.
+      2. ``amount`` must not exceed ``MONEY_CAP`` unless override is in
+         effect. Override comes from either ``max_bid_override >= amount``
+         (per-call) or HIGH_VALUE_OVERRIDE_ENV=1 (operator-wide).
+      3. If ``max_bid_override`` is supplied but below ``amount`` (override
+         set too low to authorize the spend), refuses.
+
+    Empty item_id and non-positive amount/confirm are validated upstream
+    via ValueError — those are programming errors, not safety-gate trips.
+    """
+    if confirm_amount != amount:
+        return {
+            "refused": True,
+            "reason": "confirm_mismatch",
+            "tool": tool,
+            "host": host,
+            "item_id": item_id,
+            "amount": amount,
+            "confirm_amount": confirm_amount,
+            "message": (
+                "Safety gate: confirm_amount must equal the bid/offer amount "
+                f"exactly. Got amount={amount}, confirm_amount={confirm_amount}."
+            ),
+        }
+
+    if amount > MONEY_CAP:
+        env_override = os.environ.get(HIGH_VALUE_OVERRIDE_ENV) == "1"
+        per_call_override_ok = (
+            max_bid_override is not None and max_bid_override >= amount
+        )
+        if not (env_override or per_call_override_ok):
+            return {
+                "refused": True,
+                "reason": "cap_exceeded",
+                "tool": tool,
+                "host": host,
+                "item_id": item_id,
+                "amount": amount,
+                "cap": MONEY_CAP,
+                "message": (
+                    f"Safety gate: amount ${amount:.2f} exceeds the ${MONEY_CAP:.2f} "
+                    f"per-call cap. To proceed, pass max_bid_override >= {amount} "
+                    f"or set the {HIGH_VALUE_OVERRIDE_ENV}=1 environment variable "
+                    "on the MCP server."
+                ),
+            }
+        if max_bid_override is not None and max_bid_override < amount:
+            # An explicit override below the spend is almost certainly a
+            # typo/misunderstanding; refuse rather than silently fall back
+            # to the env-var path.
+            return {
+                "refused": True,
+                "reason": "override_too_low",
+                "tool": tool,
+                "host": host,
+                "item_id": item_id,
+                "amount": amount,
+                "max_bid_override": max_bid_override,
+                "message": (
+                    f"Safety gate: max_bid_override ({max_bid_override}) is "
+                    f"less than the amount ({amount}). The override is the "
+                    "ceiling you authorize for this call; raise it to "
+                    f"at least {amount} to proceed."
+                ),
+            }
+    return None
+
+
+def _place_offer(
+    *,
+    tool: str,
+    action: str,
+    item_id: str,
+    amount: float,
+    confirm_amount: float,
+    quantity: int,
+    currency: str,
+    max_bid_override: float | None,
+    host: str | None,
+) -> dict[str, Any]:
+    """Build, gate, and dispatch a Trading PlaceOffer call.
+
+    Shared between place_bid (Action=Bid, amount→MaxBid), buy_now
+    (Action=Purchase, amount→MaxBid), and make_best_offer (Action=BestOffer,
+    amount→OfferPrice).
+    """
+    if not item_id or not item_id.strip():
+        raise ValueError("item_id is required and must be non-empty")
+    if amount <= 0:
+        raise ValueError(f"amount must be positive; got {amount}")
+    if confirm_amount <= 0:
+        raise ValueError(f"confirm_amount must be positive; got {confirm_amount}")
+    if quantity < 1:
+        raise ValueError(f"quantity must be >= 1; got {quantity}")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+
+    refusal = _check_money_gate(
+        tool=tool,
+        item_id=item_id,
+        amount=amount,
+        confirm_amount=confirm_amount,
+        max_bid_override=max_bid_override,
+        host=resolved_host,
+    )
+    if refusal is not None:
+        return refusal
+
+    # eBay PlaceOffer uses different XML elements for the price depending
+    # on Action: MaxBid for Bid/Purchase, OfferPrice for BestOffer.
+    price_element = "OfferPrice" if action == "BestOffer" else "MaxBid"
+    offer: dict[str, Any] = {
+        "Action": action,
+        price_element: {"_value": f"{amount:.2f}", "currencyID": currency},
+        "Quantity": quantity,
+    }
+    payload = {
+        "ItemID": item_id,
+        "EndUserIP": PLACE_OFFER_END_USER_IP,
+        "Offer": offer,
+    }
+    response = trading.trading_call(cfg, resolved_host, "PlaceOffer", payload=payload)
+
+    def _price_dict(node: Any) -> dict[str, Any] | None:
+        if isinstance(node, dict):
+            try:
+                value = float(node.get("_value") or 0) or None
+            except (TypeError, ValueError):
+                value = None
+            return {"value": value, "currency": node.get("currencyID")}
+        return None
+
+    result: dict[str, Any] = {
+        "host": resolved_host,
+        "tool": tool,
+        "item_id": item_id,
+        "action": action,
+        "amount": amount,
+        "currency": currency,
+        "quantity": quantity,
+        "placed": True,
+    }
+    current_price = _price_dict(response.get("CurrentPrice"))
+    if current_price:
+        result["current_price"] = current_price
+    minimum_to_outbid = _price_dict(response.get("MinimumToOutbid"))
+    if minimum_to_outbid:
+        result["minimum_to_outbid"] = minimum_to_outbid
+    if "HighBidder" in response:
+        result["high_bidder"] = response["HighBidder"] == "true"
+    if "BestOfferID" in response:
+        result["best_offer_id"] = response["BestOfferID"]
+    if resolved_host == "production":
+        result["warning"] = (
+            "PRODUCTION HOST — this call committed real money on eBay."
+        )
+    return result
+
+
+@mcp.tool()
+def place_bid(
+    item_id: str,
+    max_bid_amount: float,
+    confirm_amount: float,
+    quantity: int = 1,
+    currency: str = DEFAULT_CURRENCY,
+    max_bid_override: float | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Place a proxy bid on an eBay auction.
+
+    Trading API PlaceOffer with Action=Bid. eBay treats max_bid_amount as
+    a proxy ceiling — it bids the minimum needed to outbid the current
+    high bidder, and continues raising up to max_bid_amount as competing
+    bids come in.
+
+    PRODUCTION HOST WARNING: when the active host is "production", a
+    successful call commits real money on eBay. Inspect server_info()
+    or list_hosts() before committing.
+
+    Args:
+        item_id: numeric eBay item ID. Get from search() or get_item().
+        max_bid_amount: the proxy bid ceiling in `currency`. Must be > 0.
+        confirm_amount: must equal max_bid_amount exactly. The repeated
+            dollar amount is a safety gate against typos.
+        quantity: number of units (default 1; only relevant for
+            multi-quantity auctions).
+        currency: ISO currency code matching the listing (default "USD").
+            Must match the listing's currency or eBay refuses.
+        max_bid_override: optional ceiling that authorizes amounts above
+            the $500 per-call safety cap. Pass a value >= max_bid_amount
+            to bypass the cap for this call. Lower values are refused.
+        host: configured host name. Defaults to default_host. The active
+            host (sandbox vs production) is surfaced in the response.
+
+    Returns:
+        On success: dict with host, item_id, action="Bid", amount,
+        currency, placed=True, current_price, minimum_to_outbid,
+        high_bidder, and (on production) a warning field.
+        On safety-gate failure: structured refusal payload (refused=True,
+        reason, message, plus the offending values).
+        Raises ValueError on empty item_id, non-positive amounts, etc.
+        On eBay-side errors (listing ended, currency mismatch, insufficient
+        bid, etc.) raises TradingApiError.
+    """
+    return _place_offer(
+        tool="place_bid",
+        action="Bid",
+        item_id=item_id,
+        amount=max_bid_amount,
+        confirm_amount=confirm_amount,
+        quantity=quantity,
+        currency=currency,
+        max_bid_override=max_bid_override,
+        host=host,
+    )
+
+
+@mcp.tool()
+def buy_now(
+    item_id: str,
+    confirm_amount: float,
+    quantity: int = 1,
+    currency: str = DEFAULT_CURRENCY,
+    max_bid_override: float | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Purchase a Buy It Now listing immediately at the listed price.
+
+    Trading API PlaceOffer with Action=Purchase. The buyer commits to
+    pay the listing's BIN price; eBay creates the order on success.
+
+    PRODUCTION HOST WARNING: when the active host is "production", a
+    successful call commits real money on eBay. Inspect server_info()
+    or list_hosts() before committing.
+
+    Args:
+        item_id: numeric eBay item ID. Get from search() or get_item().
+        confirm_amount: must equal the listing's Buy-It-Now price
+            exactly. The repeated dollar amount is a safety gate against
+            stale prices or typos. Look up the current price with
+            get_item() right before calling.
+        quantity: number of units to purchase (default 1). Multi-quantity
+            BIN listings can have a per-buyer limit; eBay rejects with
+            TradingApiError if violated.
+        currency: ISO currency code matching the listing (default "USD").
+        max_bid_override: optional ceiling that authorizes amounts above
+            the $500 per-call safety cap. Pass a value >= confirm_amount
+            to bypass the cap for this call.
+        host: configured host name. Defaults to default_host.
+
+    Returns:
+        On success: dict with host, item_id, action="Purchase", amount,
+        currency, quantity, placed=True, and (on production) a warning.
+        On safety-gate failure: structured refusal payload.
+        Raises ValueError / TradingApiError as in place_bid.
+    """
+    return _place_offer(
+        tool="buy_now",
+        action="Purchase",
+        item_id=item_id,
+        amount=confirm_amount,
+        confirm_amount=confirm_amount,
+        quantity=quantity,
+        currency=currency,
+        max_bid_override=max_bid_override,
+        host=host,
+    )
+
+
+@mcp.tool()
+def make_best_offer(
+    item_id: str,
+    offer_amount: float,
+    confirm_amount: float,
+    quantity: int = 1,
+    currency: str = DEFAULT_CURRENCY,
+    max_bid_override: float | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Submit a Best Offer on a listing that has Best Offer enabled.
+
+    Trading API PlaceOffer with Action=BestOffer. The seller can accept,
+    counter, or decline; this call only places the offer.
+
+    PRODUCTION HOST WARNING: when the active host is "production" and
+    the seller accepts, the offer becomes a binding sale at the offer
+    amount.
+
+    Args:
+        item_id: numeric eBay item ID. Must have Best Offer enabled —
+            check `buying_options` on get_item() output for "BEST_OFFER".
+        offer_amount: the price the buyer offers, in `currency`. Must be
+            > 0. Many sellers configure auto-decline below a threshold.
+        confirm_amount: must equal offer_amount exactly. Safety gate.
+        quantity: number of units the offer covers (default 1).
+        currency: ISO currency code matching the listing (default "USD").
+        max_bid_override: optional ceiling that authorizes offer amounts
+            above the $500 per-call safety cap. Pass a value >=
+            offer_amount to bypass.
+        host: configured host name. Defaults to default_host.
+
+    Returns:
+        On success: dict with host, item_id, action="BestOffer",
+        amount, currency, quantity, placed=True, optionally
+        best_offer_id (for follow-up via Trading GetBestOffer / Accept
+        flows), and (on production) a warning.
+        On safety-gate failure: structured refusal payload.
+        Raises ValueError / TradingApiError as in place_bid.
+    """
+    return _place_offer(
+        tool="make_best_offer",
+        action="BestOffer",
+        item_id=item_id,
+        amount=offer_amount,
+        confirm_amount=confirm_amount,
+        quantity=quantity,
+        currency=currency,
+        max_bid_override=max_bid_override,
+        host=host,
+    )
 
 
 def main() -> None:

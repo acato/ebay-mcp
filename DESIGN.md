@@ -81,24 +81,52 @@ All tools take an optional `host` parameter. If omitted, uses `default_host` fro
 
 ### Money commits
 
-| Tool | Args | Returns |
-|---|---|---|
-| `place_bid` | `item_id`, `max_bid_amount`, `confirm_amount`, `currency="USD"`, `max_bid_override=False`, `host?` | `{placed: true, item_id, bid_amount, host}` OR structured refusal |
-| `buy_now` | `item_id`, `confirm_amount`, `quantity=1`, `currency="USD"`, `max_bid_override=False`, `host?` | `{purchased: true, item_id, total, host}` OR refusal |
-| `make_best_offer` | `item_id`, `offer_amount`, `confirm_amount`, `currency="USD"`, `max_bid_override=False`, `host?` | `{offered: true, item_id, amount, host}` OR refusal |
+All three are Trading API `PlaceOffer` with a different `Action`. They share a single `_place_offer` helper that runs the safety stack and dispatches the XML call.
+
+| Tool | Args | Action | Price element |
+|---|---|---|---|
+| `place_bid` | `item_id`, `max_bid_amount`, `confirm_amount`, `quantity=1`, `currency="USD"`, `max_bid_override=None`, `host?` | `Bid` | `<MaxBid currencyID="USD">` |
+| `buy_now` | `item_id`, `confirm_amount`, `quantity=1`, `currency="USD"`, `max_bid_override=None`, `host?` | `Purchase` | `<MaxBid currencyID="USD">` |
+| `make_best_offer` | `item_id`, `offer_amount`, `confirm_amount`, `quantity=1`, `currency="USD"`, `max_bid_override=None`, `host?` | `BestOffer` | `<OfferPrice currencyID="USD">` |
+
+`confirm_amount` is the buyer-repeated dollar figure that the LLM must produce a second time. For `buy_now`, the listing's BIN price IS the amount, so there's only one number to supply (which still has to be repeated mentally — the LLM has to look up the price via `get_item` and pass it verbatim).
+
+**Success payload (sandbox):**
+
+```json
+{
+  "host": "sandbox",
+  "tool": "place_bid",
+  "item_id": "353528728623",
+  "action": "Bid",
+  "amount": 25.00,
+  "currency": "USD",
+  "quantity": 1,
+  "placed": true,
+  "current_price": {"value": 25.00, "currency": "USD"},
+  "minimum_to_outbid": {"value": 26.00, "currency": "USD"},
+  "high_bidder": true
+}
+```
+
+On `host=production`, success payloads additionally include `"warning": "PRODUCTION HOST — this call committed real money on eBay."`.
 
 **Refusal payload shape** (matches `yahoo-mail-mcp`'s `bulk_purge_from`):
 
 ```json
 {
   "refused": true,
-  "reason": "confirm_mismatch" | "exceeds_cap" | "auth_missing" | "item_ended",
+  "reason": "confirm_mismatch" | "cap_exceeded" | "override_too_low",
+  "tool": "place_bid",
   "host": "sandbox",
-  "expected": 42.00,
-  "actual": 50.00,
-  "message": "..."
+  "item_id": "353528728623",
+  "amount": 600.00,
+  "cap": 500.00,
+  "message": "Safety gate: amount $600.00 exceeds the $500.00 per-call cap. ..."
 }
 ```
+
+Auth-missing and listing-ended cases are *not* refusals — they raise (respectively `UserNotAuthenticated` from `auth.py` and `TradingApiError` from `trading.py`). Refusals are reserved for LLM-correctable input mistakes; raises are for environmental conditions the LLM can't fix by rewording its tool call.
 
 ### Diagnostics
 
@@ -107,15 +135,18 @@ All tools take an optional `host` parameter. If omitted, uses `default_host` fro
 | `server_info` | version, active host (LOUDLY surfaces "production" when active), config path |
 | `list_hosts` | All configured hosts with status (auth ok / needs reauth / not configured) |
 
-## 5. Safety patterns (must implement before any money-commit tool ships)
+## 5. Safety patterns (implemented in `_check_money_gate` + `_place_offer`)
 
-1. **Confirm-amount must equal the value-at-risk exactly.** `place_bid(max_bid_amount=42, confirm_amount=42)` proceeds; `place_bid(42, 41)` refuses. Mirrors `bulk_purge_from`'s `confirm_count` mechanism.
-2. **Per-call dollar cap = $500** for bids/buys/offers. Higher amounts refuse unless `max_bid_override=True` is explicitly passed (per-call) OR `EBAY_MCP_ALLOW_HIGH_VALUE=1` is set (global; less recommended).
-3. **Host transparency.** Every money-commit response includes `host`. Every money-commit tool's docstring says: "running against PRODUCTION will commit real money".
-4. **`server_info` surfaces active host loudly.** `production` → response includes `warning: "PRODUCTION HOST ACTIVE — real money operations will hit production"`.
-5. **Auth-missing refusal** if user token expired and refresh failed. Don't attempt the operation half-blind.
-6. **No silent success on partial failure.** If Trading API returns `Success` with warnings (e.g., bid placed but already outbid), surface the warning.
-7. **Auction-ended refusal.** If `get_item` returns `time_left = 0` or `bid_count` indicates the auction is over, `place_bid` returns refusal with `reason: "item_ended"` without calling Trading API.
+1. **Confirm-amount must equal the value-at-risk exactly.** `place_bid(max_bid_amount=42, confirm_amount=42)` proceeds; `place_bid(42, 41)` returns `reason: "confirm_mismatch"`. Mirrors `bulk_purge_from`'s `confirm_count` mechanism. The gate uses Python's `==` on floats; values that survive a single `f"{amount:.2f}"` round-trip compare equal, which covers the common LLM-supplied-as-string-then-float path.
+2. **Per-call dollar cap = `MONEY_CAP` (currently $500)** for bids/buys/offers. Higher amounts return `reason: "cap_exceeded"` unless one of two overrides applies:
+   - **Per-call:** `max_bid_override >= amount` on the tool call. A non-None override below `amount` returns `reason: "override_too_low"` rather than silently failing through.
+   - **Global:** `EBAY_MCP_ALLOW_HIGH_VALUE=1` in the MCP server process's environment.
+   Either override clears the gate; both being set is fine.
+3. **Host transparency.** Every money-commit response includes `host`. Every money-commit tool's docstring carries a "PRODUCTION HOST WARNING" paragraph. On a production-host success, the response payload also includes a top-level `warning` field.
+4. **`server_info` surfaces active host loudly.** `production` → response includes `warning: "PRODUCTION HOST ACTIVE — bid/buy/offer operations will commit REAL money"`.
+5. **Auth-missing is a raise, not a refusal.** A missing/expired token raises `UserNotAuthenticated` from `auth.get_user_token` before any HTTP traffic; we don't half-commit.
+6. **eBay-side failures propagate as `TradingApiError`.** Insufficient bid, currency mismatch, listing ended, BIN already sold, etc. — the Trading API's `Ack=Failure` is surfaced with the parsed `Errors` block attached on `.errors`. The MCP doesn't try to interpret these; the LLM sees the eBay error code and can decide what to do.
+7. **Input shape is `ValueError`, not refusal.** Empty `item_id`, non-positive `amount` / `confirm_amount`, `quantity < 1` raise `ValueError`. Refusals are for safety gates the LLM trips by mis-using a correctly-shaped tool call; raises are for malformed calls that no LLM should generate in the first place.
 
 ## 6. Configuration
 
@@ -199,10 +230,10 @@ Refusal vs error split: anything the LLM can fix by changing inputs is refusal. 
 - **v0.0.x (Alpha):** skeleton + config + auth scaffold + `server_info` / `list_hosts`
 - **v0.1.x (Alpha):** + client_credentials OAuth + `search` / `get_item` (Browse API)
 - **v0.2.x (Alpha):** + user authorization-code flow + `get_watchlist` / `get_active_bids` / `get_won_items` / `get_lost_items` / `get_purchase_history`
-- **v0.3.x (Beta):** + `add_to_watchlist` / `remove_from_watchlist`
-- **v0.4.x (Beta):** + `place_bid` / `buy_now` / `make_best_offer` with full safety gates. Sandbox-only verification.
-- **v0.5.x (Beta):** + production smoke, README polish, all CI workflows
-- **v1.0.0:** trouble-free use against the live mailbox for ≥3 weeks; promote `Development Status` to `5 - Production/Stable`.
+- **v0.3.0 (Beta, 2026-05-28):** + `add_to_watchlist` / `remove_from_watchlist`. Production OAuth wired and live-verified.
+- **v0.4.0 (Beta, 2026-05-29):** + `place_bid` / `buy_now` / `make_best_offer` with full safety gates. Unit-tested; sandbox + production live verification deferred until after first real intended bid (`_check_money_gate` has been exercised against the operator's actual workflow shape).
+- **v0.5.x (Beta):** + production smoke, README polish, all CI workflows, PyPI publish
+- **v1.0.0:** trouble-free use in real shopping workflow for ≥3 weeks; promote `Development Status` to `5 - Production/Stable`.
 
 ## 12. Considered + skipped
 

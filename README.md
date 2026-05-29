@@ -2,7 +2,7 @@
 
 MCP server for eBay buyer-side workflows: search, watch, bid, buy, manage MyeBay. Hybrid stack — modern Buy/Browse REST API for search and item lookup, legacy Trading API (still functional in 2026) for everything stateful.
 
-> ⚠️ **Alpha.** Day 1 skeleton. Sandbox-first development; production not yet wired.
+> ⚠️ **Beta (v0.4.0).** Browse + Trading APIs wired, sandbox + production both supported. Money-commit tools live behind safety gates — read the [money commits](#money-commits-high-risk--safety-gated) section before enabling production.
 
 ## Scope
 
@@ -14,10 +14,21 @@ MCP server for eBay buyer-side workflows: search, watch, bid, buy, manage MyeBay
 - `add_to_watchlist`, `remove_from_watchlist`
 
 ### Money commits (high risk — safety-gated)
-- `place_bid`, `buy_now`, `make_best_offer` (Trading API `PlaceOffer`)
-- Each requires `confirm_amount` exactly equal to the proposed value.
-- Per-call cap: **$500**. Higher refused without `EBAY_MCP_ALLOW_HIGH_VALUE=1` or per-call `max_bid_override`.
-- Refusals are structured payloads, not exceptions — the LLM gets enough info to retry with corrected params.
+
+- `place_bid(item_id, max_bid_amount, confirm_amount, ...)` — Trading `PlaceOffer` with `Action=Bid`. Proxy bid on an auction.
+- `buy_now(item_id, confirm_amount, ...)` — Trading `PlaceOffer` with `Action=Purchase`. Commits to a Buy-It-Now sale.
+- `make_best_offer(item_id, offer_amount, confirm_amount, ...)` — Trading `PlaceOffer` with `Action=BestOffer`. Submits an offer the seller can accept/counter/decline.
+
+**Safety stack (every money tool):**
+
+1. **Confirm-amount gate.** Every call requires `confirm_amount` exactly equal to the bid/buy/offer amount. The LLM has to repeat the dollar figure; mismatches return a structured refusal payload (not an exception) so the LLM can read it and retry with corrected params.
+2. **$500 per-call cap.** Amounts above $500 refuse with `reason: "cap_exceeded"`. Two ways to authorize a higher spend:
+   - **Per-call:** pass `max_bid_override >= amount` on the tool call. Lower overrides refuse with `reason: "override_too_low"`.
+   - **Operator-wide:** set `EBAY_MCP_ALLOW_HIGH_VALUE=1` in the MCP server's environment.
+3. **Active-host visibility.** Successful calls against `default_host = "production"` include a `warning` field in the response (`"PRODUCTION HOST — this call committed real money on eBay."`). `server_info()` flags the active host before any call.
+4. **No silent half-commits.** No auth token cached → the underlying Trading API call raises before touching eBay, not mid-flight.
+
+All money tools also surface eBay-side errors (insufficient bid, currency mismatch, listing ended, etc.) as `TradingApiError` with the parsed `Errors` block attached.
 
 ### Out of scope (v0)
 - ❌ Selling side (use eBay's Sell API directly for that — different shape entirely)

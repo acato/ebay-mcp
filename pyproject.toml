@@ -1,6 +1,6 @@
 [project]
 name = "ebay-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "MCP server for searching, bidding, buying, and managing watchlist + MyeBay on eBay (Browse API + Trading API hybrid)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -10,7 +10,7 @@ authors = [
 ]
 keywords = ["mcp", "ebay", "auction", "buy", "model-context-protocol"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",

@@ -54,10 +54,21 @@ def _populate(parent: ET.Element, value: Any) -> None:
     """Recursively populate XML children from a nested Python value.
 
     - dict → one child per key
+    - dict with `_value` key → element text + XML attributes from other keys
+      (mirrors `parse_response_xml`'s output shape for attribute-bearing
+      elements like `<MaxBid currencyID="USD">25.00</MaxBid>`, so request
+      builders and response parsers share one in-memory representation)
     - list → repeated child elements (caller must pre-element them)
     - scalar (str/int/float/bool) → element text
     """
     if isinstance(value, dict):
+        if "_value" in value:
+            parent.text = str(value["_value"])
+            for k, v in value.items():
+                if k == "_value":
+                    continue
+                parent.set(k, str(v))
+            return
         for k, v in value.items():
             child = ET.SubElement(parent, k)
             _populate(child, v)

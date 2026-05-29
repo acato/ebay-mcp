@@ -119,6 +119,37 @@ def test_build_request_xml_rejects_raw_list():
         build_request_xml("X", {"Items": [1, 2, 3]})
 
 
+def test_build_request_xml_value_with_attributes():
+    """Symmetric to parse_response_xml's `{_value, attr}` shape: emit
+    `<MaxBid currencyID="USD">25.00</MaxBid>`."""
+    out = build_request_xml(
+        "PlaceOffer",
+        {
+            "ItemID": "110141552020",
+            "Offer": {
+                "Action": "Bid",
+                "MaxBid": {"_value": "25.00", "currencyID": "USD"},
+                "Quantity": 1,
+            },
+        },
+    )
+    root = ET.fromstring(out)
+    ns = f"{{{TRADING_NS}}}"
+    max_bid = root.find(f".//{ns}MaxBid")
+    assert max_bid is not None
+    assert max_bid.text == "25.00"
+    assert max_bid.get("currencyID") == "USD"
+
+
+def test_build_request_xml_round_trips_through_parse():
+    """If a payload travels build → parse → build, the structure survives."""
+    payload = {"Price": {"_value": "10.00", "currencyID": "USD"}}
+    out = build_request_xml("X", payload)
+    parsed = parse_response_xml(out.encode("utf-8"))
+    assert parsed["Price"]["_value"] == "10.00"
+    assert parsed["Price"]["currencyID"] == "USD"
+
+
 # --------------------- parse_response_xml -----------------------------------
 
 
