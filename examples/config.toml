@@ -1,0 +1,32 @@
+# ebay-mcp configuration
+#
+# Default location: ~/.config/ebay-mcp/config.toml
+# Override with the EBAY_MCP_CONFIG env var (absolute path).
+#
+# `default_host` selects which [hosts.<name>] block is used when a tool call
+# doesn't pass `host` explicitly. Flip to "production" only when you're
+# ready to commit real money.
+#
+# Credentials can also be supplied via environment variables. Precedence:
+#   1. Per-tool-call host parameter (chooses which host's creds to use)
+#   2. Env vars: EBAY_MCP_<HOST>_<FIELD> (CERT_ID, APP_ID, DEV_ID)
+#   3. Config file
+#
+# Never commit a real config file with credentials. The .gitignore excludes
+# config.local.toml, *.local.toml, and *.credentials.
+
+default_host = "sandbox"
+
+[hosts.sandbox]
+# From developer.ebay.com → Application Keysets → Sandbox
+app_id = "..."             # e.g., "Yourname-AppName-SBX-abc123def4-5678abcd"
+dev_id = "..."             # 36-char UUID-style developer ID
+cert_id = "..."            # SBX Cert ID (Client Secret); env override preferred
+redirect_uri = "https://localhost/oauth/callback"
+
+# Uncomment when ready to point at production. Production money is REAL.
+# [hosts.production]
+# app_id = "..."           # PRD App ID
+# dev_id = "..."           # Same developer Dev ID (shared)
+# cert_id = "..."          # PRD Cert ID — strongly prefer EBAY_MCP_PRODUCTION_CERT_ID env var
+# redirect_uri = "https://localhost/oauth/callback"
