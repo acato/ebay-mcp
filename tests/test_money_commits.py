@@ -32,6 +32,24 @@ SANDBOX_URL = "https://api.sandbox.ebay.com/ws/api.dll"
 PRODUCTION_URL = "https://api.ebay.com/ws/api.dll"
 
 
+def _stub_confirm(monkeypatch, *, approve: bool = True) -> list[dict[str, str]]:
+    """Stub the interactive confirm dialog. Returns a captured-calls list
+    that records the (title, body) of every dialog the code tried to show.
+
+    There is no env-var bypass in production; tests are the one place we
+    deliberately replace ``_show_modal_confirm`` because we have no human
+    at the terminal to click YES.
+    """
+    captured: list[dict[str, str]] = []
+
+    def _fake(title: str, body: str) -> bool:
+        captured.append({"title": title, "body": body})
+        return approve
+
+    monkeypatch.setattr("ebay_mcp.server._show_modal_confirm", _fake)
+    return captured
+
+
 def _setup_env(monkeypatch, tmp_path: Path, host: str = "sandbox") -> None:
     """Write a config + cache a user token for the target host."""
     cfg = tmp_path / "config.toml"
@@ -204,6 +222,7 @@ def test_place_bid_override_too_low_refused(monkeypatch, tmp_path):
 @respx.mock
 def test_place_bid_high_value_per_call_override_passes(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     monkeypatch.delenv("EBAY_MCP_ALLOW_HIGH_VALUE", raising=False)
     route = respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(200, content=_place_offer_success_xml(price="700.00"))
@@ -232,6 +251,7 @@ def test_place_bid_high_value_per_call_override_passes(monkeypatch, tmp_path):
 @respx.mock
 def test_buy_now_high_value_env_override_passes(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     monkeypatch.setenv("EBAY_MCP_ALLOW_HIGH_VALUE", "1")
     route = respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(
@@ -256,6 +276,7 @@ def test_buy_now_high_value_env_override_passes(monkeypatch, tmp_path):
 @respx.mock
 def test_place_bid_happy_path(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     route = respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(200, content=_place_offer_success_xml(price="25.00"))
     )
@@ -287,6 +308,7 @@ def test_place_bid_happy_path(monkeypatch, tmp_path):
 @respx.mock
 def test_buy_now_happy_path(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     route = respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(
             200, content=_place_offer_success_xml(action="Purchase", price="49.99")
@@ -310,6 +332,7 @@ def test_buy_now_happy_path(monkeypatch, tmp_path):
 @respx.mock
 def test_make_best_offer_happy_path(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     route = respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(
             200,
@@ -344,6 +367,7 @@ def test_make_best_offer_happy_path(monkeypatch, tmp_path):
 @respx.mock
 def test_production_host_emits_warning(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path, host="production")
+    _stub_confirm(monkeypatch)
     route = respx.post(PRODUCTION_URL).mock(
         return_value=httpx.Response(200, content=_place_offer_success_xml(price="25.00"))
     )
@@ -364,6 +388,7 @@ def test_production_host_emits_warning(monkeypatch, tmp_path):
 @respx.mock
 def test_place_bid_propagates_trading_failure(monkeypatch, tmp_path):
     _setup_env(monkeypatch, tmp_path)
+    _stub_confirm(monkeypatch)
     respx.post(SANDBOX_URL).mock(
         return_value=httpx.Response(
             200,
@@ -427,3 +452,111 @@ def test_make_best_offer_invalid_quantity_raises(monkeypatch, tmp_path):
         make_best_offer(
             "353528728623", offer_amount=10.0, confirm_amount=10.0, quantity=0
         )
+
+
+# --------------------- Interactive confirm dialog ---------------------------
+
+
+def test_user_decline_returns_refusal(monkeypatch, tmp_path):
+    """If the human clicks NO at the confirm dialog, no Trading call fires
+    and the tool returns a structured user_declined refusal."""
+    _setup_env(monkeypatch, tmp_path)
+    captured = _stub_confirm(monkeypatch, approve=False)
+
+    # No respx route — if the code somehow reaches the Trading dispatch
+    # despite the decline, respx will raise a routing error.
+    from ebay_mcp.server import place_bid
+
+    result = place_bid("353528728623", max_bid_amount=25.0, confirm_amount=25.0)
+    assert result == {
+        "refused": True,
+        "reason": "user_declined",
+        "tool": "place_bid",
+        "host": "sandbox",
+        "item_id": "353528728623",
+        "action": "Bid",
+        "amount": 25.0,
+        "currency": "USD",
+        "quantity": 1,
+        "message": (
+            "User declined (or could not see) the interactive confirmation "
+            "prompt. The call was not sent to eBay."
+        ),
+    }
+    # Exactly one dialog should have been requested before the decline.
+    assert len(captured) == 1
+
+
+def test_confirm_dialog_body_contains_call_details(monkeypatch, tmp_path):
+    """The confirm dialog's body must carry enough detail for the human
+    to recognize what they are about to commit to."""
+    _setup_env(monkeypatch, tmp_path)
+    captured = _stub_confirm(monkeypatch, approve=False)
+
+    from ebay_mcp.server import buy_now
+
+    buy_now("353528728623", confirm_amount=149.99, quantity=3)
+    assert len(captured) == 1
+    body = captured[0]["body"]
+    title = captured[0]["title"]
+    assert "buy_now" in title
+    assert "buy_now" in body
+    assert "Purchase" in body
+    assert "353528728623" in body
+    assert "149.99" in body
+    assert "USD" in body
+    assert "Quantity: 3" in body
+    assert "sandbox" in body  # the active host
+
+
+def test_confirm_dialog_flags_production_host(monkeypatch, tmp_path):
+    """Production host must be visually distinct in the dialog so the human
+    cannot mistake it for sandbox muscle-memory."""
+    _setup_env(monkeypatch, tmp_path, host="production")
+    captured = _stub_confirm(monkeypatch, approve=False)
+
+    from ebay_mcp.server import make_best_offer
+
+    make_best_offer("353528728623", offer_amount=10.0, confirm_amount=10.0)
+    assert len(captured) == 1
+    body = captured[0]["body"]
+    title = captured[0]["title"]
+    assert "PRODUCTION" in body
+    assert "REAL MONEY" in body
+    assert "PRODUCTION" in title
+
+
+def test_confirm_not_called_when_safety_gate_refuses(monkeypatch, tmp_path):
+    """The dialog fires AFTER the programmatic safety gates clear. A call
+    that trips confirm_mismatch / cap_exceeded must NOT pop the dialog,
+    so the human isn't asked about calls that were never going anywhere."""
+    _setup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("EBAY_MCP_ALLOW_HIGH_VALUE", raising=False)
+    captured = _stub_confirm(monkeypatch)
+
+    from ebay_mcp.server import place_bid
+
+    # confirm_mismatch
+    result_a = place_bid("353528728623", max_bid_amount=25.0, confirm_amount=24.0)
+    assert result_a["refused"] is True
+    assert result_a["reason"] == "confirm_mismatch"
+
+    # cap_exceeded
+    result_b = place_bid("353528728623", max_bid_amount=600.0, confirm_amount=600.0)
+    assert result_b["refused"] is True
+    assert result_b["reason"] == "cap_exceeded"
+
+    # No dialog should have been shown for either.
+    assert captured == []
+
+
+def test_confirm_not_called_when_input_invalid(monkeypatch, tmp_path):
+    """ValueErrors on input shape fire before the dialog too."""
+    _setup_env(monkeypatch, tmp_path)
+    captured = _stub_confirm(monkeypatch)
+
+    from ebay_mcp.server import place_bid
+
+    with pytest.raises(ValueError):
+        place_bid("", max_bid_amount=25.0, confirm_amount=25.0)
+    assert captured == []

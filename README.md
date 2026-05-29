@@ -2,7 +2,7 @@
 
 MCP server for eBay buyer-side workflows: search, watch, bid, buy, manage MyeBay. Hybrid stack — modern Buy/Browse REST API for search and item lookup, legacy Trading API (still functional in 2026) for everything stateful.
 
-> ⚠️ **Beta (v0.4.0).** Browse + Trading APIs wired, sandbox + production both supported. Money-commit tools live behind safety gates — read the [money commits](#money-commits-high-risk--safety-gated) section before enabling production.
+> ⚠️ **Beta (v0.4.1).** Browse + Trading APIs wired, sandbox + production both supported. Money-commit tools live behind safety gates AND an OS-modal Yes/No confirm dialog on every call — read the [money commits](#money-commits-high-risk--safety-gated) section before enabling production.
 
 ## Scope
 
@@ -25,8 +25,9 @@ MCP server for eBay buyer-side workflows: search, watch, bid, buy, manage MyeBay
 2. **$500 per-call cap.** Amounts above $500 refuse with `reason: "cap_exceeded"`. Two ways to authorize a higher spend:
    - **Per-call:** pass `max_bid_override >= amount` on the tool call. Lower overrides refuse with `reason: "override_too_low"`.
    - **Operator-wide:** set `EBAY_MCP_ALLOW_HIGH_VALUE=1` in the MCP server's environment.
-3. **Active-host visibility.** Successful calls against `default_host = "production"` include a `warning` field in the response (`"PRODUCTION HOST — this call committed real money on eBay."`). `server_info()` flags the active host before any call.
-4. **No silent half-commits.** No auth token cached → the underlying Trading API call raises before touching eBay, not mid-flight.
+3. **Human-in-the-loop confirm dialog.** After the programmatic gates clear, the MCP pops a topmost, system-modal Yes/No dialog (Windows: `MessageBoxW` via ctypes; macOS/Linux: `tkinter.messagebox`) showing the tool, host, item ID, amount, currency, and quantity. The default button is **NO**, ESC cancels, and there is no auto-dismiss or timeout. Click YES to send the call to eBay; anything else returns a `reason: "user_declined"` refusal and no Trading call fires. There is intentionally **no env-var bypass** — tests stub the dialog directly. Production-host dialogs carry a `*** PRODUCTION HOST — REAL MONEY ***` header; sandbox dialogs say `Sandbox host (no real money).`.
+4. **Active-host visibility.** Successful calls against `default_host = "production"` include a `warning` field in the response (`"PRODUCTION HOST — this call committed real money on eBay."`). `server_info()` flags the active host before any call.
+5. **No silent half-commits.** No auth token cached → the underlying Trading API call raises before touching eBay, not mid-flight.
 
 All money tools also surface eBay-side errors (insufficient bid, currency mismatch, listing ended, etc.) as `TradingApiError` with the parsed `Errors` block attached.
 

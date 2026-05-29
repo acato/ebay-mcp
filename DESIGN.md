@@ -116,7 +116,7 @@ On `host=production`, success payloads additionally include `"warning": "PRODUCT
 ```json
 {
   "refused": true,
-  "reason": "confirm_mismatch" | "cap_exceeded" | "override_too_low",
+  "reason": "confirm_mismatch" | "cap_exceeded" | "override_too_low" | "user_declined",
   "tool": "place_bid",
   "host": "sandbox",
   "item_id": "353528728623",
@@ -126,7 +126,9 @@ On `host=production`, success payloads additionally include `"warning": "PRODUCT
 }
 ```
 
-Auth-missing and listing-ended cases are *not* refusals — they raise (respectively `UserNotAuthenticated` from `auth.py` and `TradingApiError` from `trading.py`). Refusals are reserved for LLM-correctable input mistakes; raises are for environmental conditions the LLM can't fix by rewording its tool call.
+`user_declined` covers two outcomes that the LLM treats identically: the human clicked NO/ESC at the confirm dialog, OR the dialog could not display (no GUI available). The MCP refuses to silently bypass on a display failure; the operator has to fix the display before money can move.
+
+Auth-missing and listing-ended cases are *not* refusals — they raise (respectively `UserNotAuthenticated` from `auth.py` and `TradingApiError` from `trading.py`). Refusals are reserved for LLM-correctable input mistakes and human-cancellation; raises are for environmental conditions the LLM can't fix by rewording its tool call.
 
 ### Diagnostics
 
@@ -142,7 +144,11 @@ Auth-missing and listing-ended cases are *not* refusals — they raise (respecti
    - **Per-call:** `max_bid_override >= amount` on the tool call. A non-None override below `amount` returns `reason: "override_too_low"` rather than silently failing through.
    - **Global:** `EBAY_MCP_ALLOW_HIGH_VALUE=1` in the MCP server process's environment.
    Either override clears the gate; both being set is fine.
-3. **Host transparency.** Every money-commit response includes `host`. Every money-commit tool's docstring carries a "PRODUCTION HOST WARNING" paragraph. On a production-host success, the response payload also includes a top-level `warning` field.
+3. **Human-in-the-loop confirm dialog.** After the programmatic gates above clear, every money tool blocks on a topmost OS-modal Yes/No dialog rendered by `_show_modal_confirm`:
+   - **Windows**: `ctypes.windll.user32.MessageBoxW` with `MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND`. The Yes/No flavor has no working X button; the default button is NO; ESC = `IDCANCEL` = treated as No.
+   - **macOS / Linux**: `tkinter.messagebox.askyesno` with `default="no"` and a topmost root. Display-less environments return False (refuse rather than silently approve).
+   The dialog body lists tool, action, host, item ID, amount, currency, quantity. Production-host dialogs are prefixed `*** PRODUCTION HOST — REAL MONEY ***`; sandbox dialogs are prefixed `Sandbox host (no real money).` — same dialog shape on both hosts so production never feels novel. There is intentionally **no env-var bypass**. Tests stub `_show_modal_confirm` directly via `monkeypatch.setattr` because there is no human at the terminal to click YES. A No / ESC / display-unavailable result returns `reason: "user_declined"` and does not touch the Trading API.
+4. **Host transparency.** Every money-commit response includes `host`. Every money-commit tool's docstring carries a "PRODUCTION HOST WARNING" paragraph. On a production-host success, the response payload also includes a top-level `warning` field.
 4. **`server_info` surfaces active host loudly.** `production` → response includes `warning: "PRODUCTION HOST ACTIVE — bid/buy/offer operations will commit REAL money"`.
 5. **Auth-missing is a raise, not a refusal.** A missing/expired token raises `UserNotAuthenticated` from `auth.get_user_token` before any HTTP traffic; we don't half-commit.
 6. **eBay-side failures propagate as `TradingApiError`.** Insufficient bid, currency mismatch, listing ended, BIN already sold, etc. — the Trading API's `Ack=Failure` is surfaced with the parsed `Errors` block attached on `.errors`. The MCP doesn't try to interpret these; the LLM sees the eBay error code and can decide what to do.
@@ -231,7 +237,8 @@ Refusal vs error split: anything the LLM can fix by changing inputs is refusal. 
 - **v0.1.x (Alpha):** + client_credentials OAuth + `search` / `get_item` (Browse API)
 - **v0.2.x (Alpha):** + user authorization-code flow + `get_watchlist` / `get_active_bids` / `get_won_items` / `get_lost_items` / `get_purchase_history`
 - **v0.3.0 (Beta, 2026-05-28):** + `add_to_watchlist` / `remove_from_watchlist`. Production OAuth wired and live-verified.
-- **v0.4.0 (Beta, 2026-05-29):** + `place_bid` / `buy_now` / `make_best_offer` with full safety gates. Unit-tested; sandbox + production live verification deferred until after first real intended bid (`_check_money_gate` has been exercised against the operator's actual workflow shape).
+- **v0.4.0 (Beta, 2026-05-29):** + `place_bid` / `buy_now` / `make_best_offer` with confirm-amount + $500 cap + override safety stack. Unit-tested; sandbox + production live verification deferred until after first real intended bid.
+- **v0.4.1 (Beta, 2026-05-29):** + interactive OS-modal confirm dialog before every money commit on every host. No env-var bypass; tests stub `_show_modal_confirm` directly.
 - **v0.5.x (Beta):** + production smoke, README polish, all CI workflows, PyPI publish
 - **v1.0.0:** trouble-free use in real shopping workflow for ≥3 weeks; promote `Development Status` to `5 - Production/Stable`.
 

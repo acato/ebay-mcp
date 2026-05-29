@@ -8,6 +8,7 @@ tools (search, watchlist, bidding, etc.) land in Day 1b onward.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import httpx
@@ -710,6 +711,116 @@ def complete_user_auth(
     return auth.complete_user_auth(cfg, resolved_host, code, state=state)
 
 
+def _show_modal_confirm(title: str, body: str) -> bool:
+    """Display a topmost, system-modal Yes/No dialog and block until clicked.
+
+    Returns True for Yes, False for anything else (No, Cancel, ESC, GUI
+    unavailable). No timeout; no auto-dismiss; default button is NO so a
+    stray Enter-press cancels rather than confirms.
+
+    Platform notes:
+      - Windows: ctypes → user32.MessageBoxW. The Yes/No flavor has no
+        working close (X) button; ESC = IDCANCEL = treated as No.
+      - macOS / Linux: tkinter (stdlib). Requires a usable display.
+        Headless environments return False (refuse rather than silently
+        bypass).
+
+    This is the single chokepoint for the human-in-the-loop confirmation
+    on every money-commit tool. Tests stub it via
+    ``monkeypatch.setattr("ebay_mcp.server._show_modal_confirm", lambda
+    *_: True)``.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # MB_YESNO=0x4, MB_ICONWARNING=0x30, MB_DEFBUTTON2=0x100 (NO
+            # default), MB_TOPMOST=0x40000, MB_SETFOREGROUND=0x10000.
+            flags = 0x4 | 0x30 | 0x100 | 0x40000 | 0x10000
+            result = ctypes.windll.user32.MessageBoxW(0, body, title, flags)
+            return result == 6  # IDYES
+        except Exception:
+            # Never let a GUI failure auto-approve money.
+            return False
+    try:
+        import tkinter
+        from tkinter import messagebox
+    except ImportError:
+        return False
+    try:
+        root = tkinter.Tk()
+        root.attributes("-topmost", True)
+        root.withdraw()
+        try:
+            result = messagebox.askyesno(title, body, icon="warning", default="no")
+        finally:
+            root.destroy()
+        return bool(result)
+    except Exception:
+        # Display unavailable (no $DISPLAY, no WindowServer, etc.). Refuse
+        # rather than silently proceed without confirmation.
+        return False
+
+
+def _confirm_money_action(
+    *,
+    tool: str,
+    action: str,
+    item_id: str,
+    amount: float,
+    currency: str,
+    quantity: int,
+    host: str,
+) -> dict[str, Any] | None:
+    """Show the human-in-the-loop confirm dialog for a money-commit call.
+
+    Returns None when the user clicks Yes (proceed); returns a structured
+    refusal payload (``reason="user_declined"``) when the user clicks No
+    or the dialog cannot display. The dialog is the same on sandbox and
+    production hosts — muscle-memory in sandbox makes production feel
+    routine, not novel — but production gets a louder header.
+
+    There is intentionally no env-var bypass. Tests must stub
+    ``_show_modal_confirm`` directly.
+    """
+    host_label = host.upper()
+    title = f"ebay-mcp: confirm {tool} on {host_label}"
+    lines = [
+        f"Tool:     {tool}",
+        f"Action:   {action}",
+        f"Host:     {host}",
+        f"Item:     {item_id}",
+        f"Amount:   {amount:.2f} {currency}",
+        f"Quantity: {quantity}",
+        "",
+        "Click YES to proceed, NO to cancel.",
+    ]
+    if host == "production":
+        header = "*** PRODUCTION HOST — REAL MONEY ***\n\n"
+    else:
+        header = "Sandbox host (no real money).\n\n"
+    body = header + "\n".join(lines)
+
+    approved = _show_modal_confirm(title, body)
+    if approved:
+        return None
+    return {
+        "refused": True,
+        "reason": "user_declined",
+        "tool": tool,
+        "host": host,
+        "item_id": item_id,
+        "action": action,
+        "amount": amount,
+        "currency": currency,
+        "quantity": quantity,
+        "message": (
+            "User declined (or could not see) the interactive confirmation "
+            "prompt. The call was not sent to eBay."
+        ),
+    }
+
+
 def _check_money_gate(
     *,
     tool: str,
@@ -836,6 +947,21 @@ def _place_offer(
     )
     if refusal is not None:
         return refusal
+
+    # Human-in-the-loop gate. Runs AFTER programmatic safety gates clear so
+    # we don't pop a dialog for a call that was going to be refused anyway,
+    # and BEFORE the Trading dispatch so a No-click means nothing hit eBay.
+    decline = _confirm_money_action(
+        tool=tool,
+        action=action,
+        item_id=item_id,
+        amount=amount,
+        currency=currency,
+        quantity=quantity,
+        host=resolved_host,
+    )
+    if decline is not None:
+        return decline
 
     # eBay PlaceOffer uses different XML elements for the price depending
     # on Action: MaxBid for Bid/Purchase, OfferPrice for BestOffer.
