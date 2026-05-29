@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ebay_mcp import __version__, auth
+from ebay_mcp import __version__, auth, trading
 from ebay_mcp.auth import get_app_token
 from ebay_mcp.config import Config, config_path, load_config
 from ebay_mcp.urls import urls_for_host
@@ -318,6 +318,122 @@ def get_item(item_id: str, marketplace: str = "EBAY_US", host: str | None = None
     out = _normalize_item_detail(body)
     out["host"] = resolved_host
     return out
+
+
+def _normalize_trading_item(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project a Trading API <Item> dict to the LLM-facing summary shape.
+
+    Mirrors the keys we use for Browse API search hits where they overlap
+    (item_id, title, price, currency, ends_at, web_url, bid_count, seller),
+    so an LLM consuming both Browse and Trading results sees a consistent
+    surface.
+    """
+    selling_status = raw.get("SellingStatus") or {}
+    current_price = selling_status.get("CurrentPrice") or {}
+    # CurrentPrice element is `<CurrentPrice currencyID="USD">9.99</CurrentPrice>`
+    # which our parser maps to {"_value": "9.99", "currencyID": "USD"}.
+    if isinstance(current_price, dict):
+        try:
+            price: float | None = float(current_price.get("_value") or 0) or None
+        except (TypeError, ValueError):
+            price = None
+        currency = current_price.get("currencyID")
+    else:
+        price = None
+        currency = None
+
+    seller = raw.get("Seller") or {}
+
+    def _to_int(value: Any) -> int | None:
+        try:
+            return int(value) if value not in (None, "", {}) else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "item_id": raw.get("ItemID") or "",
+        "title": raw.get("Title") or "",
+        "price": price,
+        "currency": currency,
+        "ends_at": raw.get("EndTime"),
+        "bid_count": _to_int(selling_status.get("BidCount")),
+        "seller": seller.get("UserID") if isinstance(seller, dict) else None,
+        "web_url": raw.get("ViewItemURL") or "",
+        "listing_type": raw.get("ListingType"),
+        "quantity_available": _to_int(raw.get("Quantity")),
+    }
+
+
+@mcp.tool()
+def get_watchlist(
+    limit: int = 100,
+    offset: int = 0,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Return the authenticated user's watched items.
+
+    Uses Trading API `GetMyeBayBuying` with the WatchList container.
+    Requires that the user has authenticated via `start_user_auth` +
+    `complete_user_auth` for the chosen host.
+
+    Args:
+        limit: items per page (1-200). Default 100.
+        offset: pagination offset. Trading API pages from 1; we translate.
+        host: configured host name. Defaults to default_host.
+
+    Returns:
+        dict with `host`, `total`, `limit`, `offset`, and `hits` (a list
+        of item summaries: item_id, title, price, currency, ends_at,
+        bid_count, seller, web_url, listing_type, quantity_available).
+    """
+    if limit < 1 or limit > 200:
+        raise ValueError("limit must be between 1 and 200")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+
+    # Trading API uses 1-based page numbers, not offsets. Convert.
+    page_number = (offset // limit) + 1
+
+    response = trading.trading_call(
+        cfg,
+        resolved_host,
+        "GetMyeBayBuying",
+        payload={
+            "WatchList": {
+                "Include": True,
+                "Pagination": {
+                    "EntriesPerPage": limit,
+                    "PageNumber": page_number,
+                },
+            }
+        },
+    )
+
+    watch_list = response.get("WatchList") or {}
+    item_array = watch_list.get("ItemArray") or {}
+    raw_items = item_array.get("Item") or []
+    if isinstance(raw_items, dict):
+        # Single result: parser returns a dict instead of a list.
+        raw_items = [raw_items]
+
+    pagination = watch_list.get("PaginationResult") or {}
+    try:
+        total = int(pagination.get("TotalNumberOfEntries", "0"))
+    except (TypeError, ValueError):
+        total = len(raw_items)
+
+    hits = [_normalize_trading_item(item) for item in raw_items]
+
+    return {
+        "host": resolved_host,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hits": hits,
+    }
 
 
 @mcp.tool()

@@ -32,14 +32,17 @@ TOKEN_REFRESH_BUFFER_SECONDS = 300
 # available at this grant level; user-scoped operations need authorization_code.
 APP_TOKEN_SCOPES = "https://api.ebay.com/oauth/api_scope"
 
-# User-scoped OAuth2 scopes needed for the v0.2+ tool surface (MyeBay reads,
-# watchlist read/write, bid/buy via Trading API IAF tokens).
-USER_TOKEN_SCOPES: tuple[str, ...] = (
-    "https://api.ebay.com/oauth/api_scope",
-    "https://api.ebay.com/oauth/api_scope/buy.order.readonly",
-    "https://api.ebay.com/oauth/api_scope/buy.marketing",
-    "https://api.ebay.com/oauth/api_scope/buy.guest.order",
-)
+# User-scoped OAuth2 scopes needed for the v0.2+ tool surface.
+#
+# Sandbox apps don't get all scopes enabled by default — eBay rejects the
+# whole authorization request with `error=invalid_scope` if any single
+# scope isn't pre-approved for the app. Starting with the broad base scope
+# only; the Trading API accepts it for most buyer operations including
+# watchlist + MyeBay reads + bidding.
+#
+# Add `buy.order.readonly`, `buy.marketing`, `buy.guest.order` etc.
+# back here once the developer portal shows them as enabled for the app.
+USER_TOKEN_SCOPES: tuple[str, ...] = ("https://api.ebay.com/oauth/api_scope",)
 
 
 class UserNotAuthenticated(Exception):
