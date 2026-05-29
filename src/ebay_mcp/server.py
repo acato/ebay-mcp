@@ -557,6 +557,91 @@ def get_lost_items(
 
 
 @mcp.tool()
+def add_to_watchlist(item_id: str, host: str | None = None) -> dict[str, Any]:
+    """Add an item to the authenticated user's watchlist.
+
+    Trading API `AddToWatchList`. Fully reversible — call
+    `remove_from_watchlist` with the same item_id to undo.
+
+    Args:
+        item_id: numeric eBay item ID (from `search`, `get_item`, etc.)
+        host: configured host. Defaults to default_host.
+
+    Returns:
+        dict with `host`, `item_id`, `added: True`, and
+        `watch_list_count` (total items in the watchlist after the
+        operation). Raises ValueError on empty item_id.
+        On eBay-side errors (item ended, already watched, etc.) the
+        Trading API raises TradingApiError with details.
+    """
+    if not item_id or not item_id.strip():
+        raise ValueError("item_id is required and must be non-empty")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    response = trading.trading_call(
+        cfg, resolved_host, "AddToWatchList", payload={"ItemID": item_id}
+    )
+
+    raw_count = response.get("WatchListCount")
+    if not raw_count:
+        count = -1
+    else:
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = -1
+    return {
+        "host": resolved_host,
+        "item_id": item_id,
+        "added": True,
+        "watch_list_count": count,
+    }
+
+
+@mcp.tool()
+def remove_from_watchlist(item_id: str, host: str | None = None) -> dict[str, Any]:
+    """Remove an item from the authenticated user's watchlist.
+
+    Trading API `RemoveFromWatchList`. Fully reversible — call
+    `add_to_watchlist` with the same item_id to undo.
+
+    Args:
+        item_id: numeric eBay item ID currently on the watchlist.
+        host: configured host. Defaults to default_host.
+
+    Returns:
+        dict with `host`, `item_id`, `removed: True`, and
+        `watch_list_count` (total items in the watchlist after the
+        operation). Raises ValueError on empty item_id. eBay-side
+        errors (item not on watchlist, etc.) surface as TradingApiError.
+    """
+    if not item_id or not item_id.strip():
+        raise ValueError("item_id is required and must be non-empty")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    response = trading.trading_call(
+        cfg, resolved_host, "RemoveFromWatchList", payload={"ItemID": item_id}
+    )
+
+    raw_count = response.get("WatchListCount")
+    if not raw_count:
+        count = -1
+    else:
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = -1
+    return {
+        "host": resolved_host,
+        "item_id": item_id,
+        "removed": True,
+        "watch_list_count": count,
+    }
+
+
+@mcp.tool()
 def start_user_auth(host: str | None = None) -> dict[str, Any]:
     """Begin OAuth2 user authentication for buyer-side eBay operations.
 
