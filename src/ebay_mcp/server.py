@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ebay_mcp import __version__
+from ebay_mcp import __version__, auth
 from ebay_mcp.auth import get_app_token
 from ebay_mcp.config import Config, config_path, load_config
 from ebay_mcp.urls import urls_for_host
@@ -318,6 +318,63 @@ def get_item(item_id: str, marketplace: str = "EBAY_US", host: str | None = None
     out = _normalize_item_detail(body)
     out["host"] = resolved_host
     return out
+
+
+@mcp.tool()
+def start_user_auth(host: str | None = None) -> dict[str, Any]:
+    """Begin OAuth2 user authentication for buyer-side eBay operations.
+
+    Watchlist, MyeBay reads, bidding, and buying all require a user token.
+    This tool returns an `auth_url` for you (the human) to open in a browser.
+    After signing in and granting permissions, eBay redirects to the
+    configured `redirect_uri` with a `code` query parameter — pass that to
+    `complete_user_auth` to finalize.
+
+    Most workflows only run this once per host; tokens persist 18 months
+    and auto-refresh.
+
+    Args:
+        host: which configured host to authenticate against. Defaults to
+            config's `default_host`.
+
+    Returns:
+        dict with `host`, `auth_url`, `state`, and `instructions`. The
+        `auth_url` is what the human needs to open; the `state` is
+        round-tripped to verify the callback genuinely came from this flow.
+    """
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    return auth.start_user_auth(cfg, resolved_host)
+
+
+@mcp.tool()
+def complete_user_auth(
+    code: str, state: str | None = None, host: str | None = None
+) -> dict[str, Any]:
+    """Finish OAuth2 user auth by exchanging the authorization code for tokens.
+
+    The `code` is the value of the `code` query parameter in the URL eBay
+    redirected to after start_user_auth's `auth_url`. Optionally pass `state`
+    to verify against what start_user_auth issued (CSRF defense).
+
+    Args:
+        code: the authorization code from eBay's redirect URL.
+        state: optional — the state value from the redirect URL. If provided,
+            must match what start_user_auth stored. Mismatch returns a
+            structured refusal payload.
+        host: which configured host to authenticate against. Defaults to
+            config's `default_host`. Must match the host used in
+            start_user_auth.
+
+    Returns:
+        On success: {host, authenticated: true, access_expires_at,
+                     refresh_expires_at}
+        On state mismatch: {refused: true, reason: "state_mismatch", host,
+                            message: ...}
+    """
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    return auth.complete_user_auth(cfg, resolved_host, code, state=state)
 
 
 def main() -> None:
