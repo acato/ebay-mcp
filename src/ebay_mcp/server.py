@@ -350,7 +350,7 @@ def _normalize_trading_item(raw: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             return None
 
-    return {
+    out: dict[str, Any] = {
         "item_id": raw.get("ItemID") or "",
         "title": raw.get("Title") or "",
         "price": price,
@@ -361,6 +361,121 @@ def _normalize_trading_item(raw: dict[str, Any]) -> dict[str, Any]:
         "web_url": raw.get("ViewItemURL") or "",
         "listing_type": raw.get("ListingType"),
         "quantity_available": _to_int(raw.get("Quantity")),
+    }
+    # WonList items carry purchase-transaction metadata (paid/shipped/status)
+    # that the upstream extractor tagged onto the raw dict. Surface a flat
+    # subset on the envelope.
+    txn = raw.get("_transaction")
+    if isinstance(txn, dict):
+        out["purchase_date"] = txn.get("created_date")
+        out["paid_at"] = txn.get("paid_time")
+        out["shipped_at"] = txn.get("shipped_time")
+        out["transaction_status"] = txn.get("status")
+        out["buyer_paid_status"] = txn.get("buyer_paid_status")
+        out["quantity_purchased"] = _to_int(txn.get("quantity_purchased"))
+        out["transaction_id"] = txn.get("transaction_id")
+    return out
+
+
+def _extract_items_from_container(container: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pull item dicts out of a GetMyeBayBuying container.
+
+    Two layouts exist:
+      - **ItemArray > Item** (WatchList, BidList, LostList): straight item rows.
+      - **OrderTransactionArray > OrderTransaction > Transaction > Item**
+        (WonList): items wrapped in purchase-transaction metadata. We unwrap
+        and tag the item with the surrounding transaction fields (purchase
+        date, paid/shipped times, transaction status) so the normalized
+        envelope can surface them.
+    """
+    item_array = container.get("ItemArray") or {}
+    raw = item_array.get("Item")
+    if raw:
+        return [raw] if isinstance(raw, dict) else list(raw)
+
+    ot_array = container.get("OrderTransactionArray") or {}
+    raw_ots = ot_array.get("OrderTransaction") or []
+    if isinstance(raw_ots, dict):
+        raw_ots = [raw_ots]
+
+    items: list[dict[str, Any]] = []
+    for ot in raw_ots:
+        txn = ot.get("Transaction") or {}
+        item = txn.get("Item")
+        if not isinstance(item, dict):
+            continue
+        # Copy so we don't mutate the parsed response; tag with txn metadata.
+        annotated = dict(item)
+        annotated["_transaction"] = {
+            "transaction_id": txn.get("TransactionID"),
+            "created_date": txn.get("CreatedDate"),
+            "paid_time": txn.get("PaidTime"),
+            "shipped_time": txn.get("ShippedTime"),
+            "status": txn.get("Status"),
+            "buyer_paid_status": txn.get("BuyerPaidStatus"),
+            "quantity_purchased": txn.get("QuantityPurchased"),
+        }
+        items.append(annotated)
+    return items
+
+
+def _get_mybuying_container(
+    container_name: str,
+    limit: int,
+    offset: int,
+    host: str | None,
+    *,
+    extra_container_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shared logic for the four GetMyeBayBuying containers.
+
+    container_name: "WatchList" | "BidList" | "WonList" | "LostList"
+    """
+    if limit < 1 or limit > 200:
+        raise ValueError("limit must be between 1 and 200")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+
+    # Trading API uses 1-based page numbers, not offsets. Convert.
+    page_number = (offset // limit) + 1
+    container_payload: dict[str, Any] = {
+        "Include": True,
+        "Pagination": {
+            "EntriesPerPage": limit,
+            "PageNumber": page_number,
+        },
+    }
+    if extra_container_fields:
+        container_payload.update(extra_container_fields)
+
+    response = trading.trading_call(
+        cfg,
+        resolved_host,
+        "GetMyeBayBuying",
+        payload={container_name: container_payload},
+    )
+
+    container = response.get(container_name) or {}
+    raw_items = _extract_items_from_container(container)
+
+    pagination = container.get("PaginationResult") or {}
+    try:
+        total = int(pagination.get("TotalNumberOfEntries", "0"))
+    except (TypeError, ValueError):
+        total = len(raw_items)
+
+    hits = [_normalize_trading_item(item) for item in raw_items]
+
+    return {
+        "host": resolved_host,
+        "container": container_name,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hits": hits,
     }
 
 
@@ -382,58 +497,63 @@ def get_watchlist(
         host: configured host name. Defaults to default_host.
 
     Returns:
-        dict with `host`, `total`, `limit`, `offset`, and `hits` (a list
-        of item summaries: item_id, title, price, currency, ends_at,
-        bid_count, seller, web_url, listing_type, quantity_available).
+        dict with `host`, `container`, `total`, `limit`, `offset`, and
+        `hits` (a list of item summaries: item_id, title, price, currency,
+        ends_at, bid_count, seller, web_url, listing_type,
+        quantity_available).
     """
-    if limit < 1 or limit > 200:
-        raise ValueError("limit must be between 1 and 200")
-    if offset < 0:
-        raise ValueError("offset must be >= 0")
+    return _get_mybuying_container("WatchList", limit, offset, host)
 
-    cfg = _config()
-    resolved_host = cfg.resolve_host(host)
 
-    # Trading API uses 1-based page numbers, not offsets. Convert.
-    page_number = (offset // limit) + 1
+@mcp.tool()
+def get_active_bids(
+    limit: int = 100,
+    offset: int = 0,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Return auctions where the user has a currently-active bid.
 
-    response = trading.trading_call(
-        cfg,
-        resolved_host,
-        "GetMyeBayBuying",
-        payload={
-            "WatchList": {
-                "Include": True,
-                "Pagination": {
-                    "EntriesPerPage": limit,
-                    "PageNumber": page_number,
-                },
-            }
-        },
-    )
+    Trading API GetMyeBayBuying.BidList. Includes both winning and
+    outbid items still in their bidding period.
 
-    watch_list = response.get("WatchList") or {}
-    item_array = watch_list.get("ItemArray") or {}
-    raw_items = item_array.get("Item") or []
-    if isinstance(raw_items, dict):
-        # Single result: parser returns a dict instead of a list.
-        raw_items = [raw_items]
+    Same response shape as `get_watchlist`. Empty hits + total=0 means
+    you have no active bids.
+    """
+    return _get_mybuying_container("BidList", limit, offset, host)
 
-    pagination = watch_list.get("PaginationResult") or {}
-    try:
-        total = int(pagination.get("TotalNumberOfEntries", "0"))
-    except (TypeError, ValueError):
-        total = len(raw_items)
 
-    hits = [_normalize_trading_item(item) for item in raw_items]
+@mcp.tool()
+def get_won_items(
+    limit: int = 100,
+    offset: int = 0,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Return items the user won at auction or bought via Buy It Now.
 
-    return {
-        "host": resolved_host,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "hits": hits,
-    }
+    Trading API GetMyeBayBuying.WonList. This is your effective
+    "purchase history" for the eBay-native default lookback window
+    (eBay shows the last 30 days by default; older items roll off
+    the WonList container).
+
+    Same response shape as `get_watchlist`.
+    """
+    return _get_mybuying_container("WonList", limit, offset, host)
+
+
+@mcp.tool()
+def get_lost_items(
+    limit: int = 100,
+    offset: int = 0,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Return auctions where the user bid but did not win.
+
+    Trading API GetMyeBayBuying.LostList. Default lookback ~30 days;
+    older items roll off.
+
+    Same response shape as `get_watchlist`.
+    """
+    return _get_mybuying_container("LostList", limit, offset, host)
 
 
 @mcp.tool()

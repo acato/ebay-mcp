@@ -252,3 +252,187 @@ def test_get_watchlist_limit_validation(monkeypatch, tmp_path):
         get_watchlist(limit=999)
     with pytest.raises(ValueError, match="offset must be >= 0"):
         get_watchlist(offset=-1)
+
+
+# --------------------- get_active_bids / get_won_items / get_lost_items ------
+
+
+_GET_MY_BUYING_PARAMS = [
+    ("get_active_bids", "BidList"),
+    ("get_won_items", "WonList"),
+    ("get_lost_items", "LostList"),
+]
+
+
+@respx.mock
+@pytest.mark.parametrize(("tool_name", "expected_container"), _GET_MY_BUYING_PARAMS)
+def test_my_buying_container_in_request(monkeypatch, tmp_path, tool_name, expected_container):
+    """Each tool must send its container's name in the XML request."""
+    _setup_env(monkeypatch, tmp_path)
+
+    route = respx.post("https://api.sandbox.ebay.com/ws/api.dll").mock(
+        return_value=httpx.Response(
+            200,
+            content=(
+                b'<?xml version="1.0"?>'
+                b'<GetMyeBayBuyingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+                b"<Ack>Success</Ack>"
+                b"<" + expected_container.encode() + b">"
+                b"<ItemArray/>"
+                b"<PaginationResult><TotalNumberOfEntries>0</TotalNumberOfEntries></PaginationResult>"
+                b"</" + expected_container.encode() + b">"
+                b"</GetMyeBayBuyingResponse>"
+            ),
+        )
+    )
+
+    import ebay_mcp.server as server_module
+
+    tool = getattr(server_module, tool_name)
+    result = tool()
+
+    assert result["container"] == expected_container
+    assert result["total"] == 0
+    assert result["hits"] == []
+
+    body = route.calls.last.request.content
+    assert b"<" + expected_container.encode() + b">" in body
+    assert b"<Include>true</Include>" in body
+
+
+@respx.mock
+@pytest.mark.parametrize(("tool_name", "expected_container"), _GET_MY_BUYING_PARAMS)
+def test_my_buying_normalizes_items(monkeypatch, tmp_path, tool_name, expected_container):
+    """Each tool should run items through _normalize_trading_item."""
+    _setup_env(monkeypatch, tmp_path)
+
+    respx.post("https://api.sandbox.ebay.com/ws/api.dll").mock(
+        return_value=httpx.Response(
+            200,
+            content=(
+                b'<?xml version="1.0"?>'
+                b'<GetMyeBayBuyingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+                b"<Ack>Success</Ack>"
+                b"<" + expected_container.encode() + b">"
+                b"<ItemArray>"
+                b"<Item>"
+                b"<ItemID>ITEM-42</ItemID>"
+                b"<Title>Something</Title>"
+                b"<SellingStatus>"
+                b'<CurrentPrice currencyID="USD">42.42</CurrentPrice>'
+                b"</SellingStatus>"
+                b"</Item>"
+                b"</ItemArray>"
+                b"<PaginationResult><TotalNumberOfEntries>1</TotalNumberOfEntries></PaginationResult>"
+                b"</" + expected_container.encode() + b">"
+                b"</GetMyeBayBuyingResponse>"
+            ),
+        )
+    )
+
+    import ebay_mcp.server as server_module
+
+    tool = getattr(server_module, tool_name)
+    result = tool()
+
+    assert result["total"] == 1
+    assert len(result["hits"]) == 1
+    assert result["hits"][0]["item_id"] == "ITEM-42"
+    assert result["hits"][0]["price"] == 42.42
+    assert result["hits"][0]["currency"] == "USD"
+
+
+@pytest.mark.parametrize(("tool_name", "_container"), _GET_MY_BUYING_PARAMS)
+def test_my_buying_validation(monkeypatch, tmp_path, tool_name, _container):
+    """limit/offset bounds are enforced for every tool, not just get_watchlist."""
+    _setup_env(monkeypatch, tmp_path)
+    import ebay_mcp.server as server_module
+
+    tool = getattr(server_module, tool_name)
+    with pytest.raises(ValueError, match="limit must be between 1 and 200"):
+        tool(limit=0)
+    with pytest.raises(ValueError, match="offset must be >= 0"):
+        tool(offset=-1)
+
+
+@respx.mock
+def test_get_active_bids_includes_container_field(monkeypatch, tmp_path):
+    """Smoke: container field in response identifies which list this is."""
+    _setup_env(monkeypatch, tmp_path)
+    respx.post("https://api.sandbox.ebay.com/ws/api.dll").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"""<?xml version="1.0"?>
+            <GetMyeBayBuyingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+              <Ack>Success</Ack>
+              <BidList>
+                <ItemArray/>
+                <PaginationResult><TotalNumberOfEntries>0</TotalNumberOfEntries></PaginationResult>
+              </BidList>
+            </GetMyeBayBuyingResponse>""",
+        )
+    )
+
+    from ebay_mcp.server import get_active_bids
+
+    result = get_active_bids()
+    assert result["container"] == "BidList"
+
+
+@respx.mock
+def test_get_won_items_unwraps_order_transaction_array(monkeypatch, tmp_path):
+    """WonList nests items inside OrderTransactionArray > OrderTransaction
+    > Transaction > Item — we must unwrap and tag with transaction metadata.
+    """
+    _setup_env(monkeypatch, tmp_path)
+    respx.post("https://api.sandbox.ebay.com/ws/api.dll").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"""<?xml version="1.0"?>
+            <GetMyeBayBuyingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+              <Ack>Success</Ack>
+              <WonList>
+                <OrderTransactionArray>
+                  <OrderTransaction>
+                    <Transaction>
+                      <TransactionID>12345</TransactionID>
+                      <CreatedDate>2026-05-01T10:00:00.000Z</CreatedDate>
+                      <PaidTime>2026-05-01T10:05:00.000Z</PaidTime>
+                      <ShippedTime>2026-05-02T08:00:00.000Z</ShippedTime>
+                      <Status><CheckoutStatus>Complete</CheckoutStatus></Status>
+                      <BuyerPaidStatus>PaidWithPayPal</BuyerPaidStatus>
+                      <QuantityPurchased>2</QuantityPurchased>
+                      <Item>
+                        <ItemID>WON-100</ItemID>
+                        <Title>Purchased gadget</Title>
+                        <SellingStatus>
+                          <CurrentPrice currencyID="USD">55.00</CurrentPrice>
+                        </SellingStatus>
+                        <Seller><UserID>nice_seller</UserID></Seller>
+                      </Item>
+                    </Transaction>
+                  </OrderTransaction>
+                </OrderTransactionArray>
+                <PaginationResult><TotalNumberOfEntries>1</TotalNumberOfEntries></PaginationResult>
+              </WonList>
+            </GetMyeBayBuyingResponse>""",
+        )
+    )
+
+    from ebay_mcp.server import get_won_items
+
+    result = get_won_items()
+    assert result["total"] == 1
+    assert len(result["hits"]) == 1
+    hit = result["hits"][0]
+    assert hit["item_id"] == "WON-100"
+    assert hit["title"] == "Purchased gadget"
+    assert hit["price"] == 55.0
+    assert hit["seller"] == "nice_seller"
+    # Transaction metadata flattened onto the envelope.
+    assert hit["transaction_id"] == "12345"
+    assert hit["purchase_date"] == "2026-05-01T10:00:00.000Z"
+    assert hit["paid_at"] == "2026-05-01T10:05:00.000Z"
+    assert hit["shipped_at"] == "2026-05-02T08:00:00.000Z"
+    assert hit["buyer_paid_status"] == "PaidWithPayPal"
+    assert hit["quantity_purchased"] == 2
