@@ -9,12 +9,47 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from ebay_mcp import __version__
+from ebay_mcp.auth import get_app_token
 from ebay_mcp.config import Config, config_path, load_config
+from ebay_mcp.urls import urls_for_host
 
 mcp = FastMCP("ebay-mcp")
+
+# Hard caps that keep individual tool responses tractable for the LLM.
+SEARCH_LIMIT_MAX = 200
+DEFAULT_SEARCH_LIMIT = 20
+
+# Map LLM-facing sort names → eBay Browse API sort parameter values.
+_SORT_MAP: dict[str, str | None] = {
+    "best_match": None,  # eBay default, no sort param
+    "price_asc": "price",
+    "price_desc": "-price",
+    "newly_listed": "newlyListed",
+    "ending_soonest": "endingSoonest",
+}
+
+# Valid Browse API condition strings. eBay rejects anything else.
+VALID_CONDITIONS = {
+    "NEW",
+    "LIKE_NEW",
+    "NEW_OTHER",
+    "NEW_WITH_DEFECTS",
+    "MANUFACTURER_REFURBISHED",
+    "CERTIFIED_REFURBISHED",
+    "EXCELLENT_REFURBISHED",
+    "VERY_GOOD_REFURBISHED",
+    "GOOD_REFURBISHED",
+    "SELLER_REFURBISHED",
+    "USED_EXCELLENT",
+    "USED_VERY_GOOD",
+    "USED_GOOD",
+    "USED_ACCEPTABLE",
+    "FOR_PARTS_OR_NOT_WORKING",
+}
 
 
 def _config() -> Config:
@@ -76,6 +111,212 @@ def list_hosts() -> list[dict[str, Any]]:
                 "redirect_uri": host.redirect_uri,
             }
         )
+    return out
+
+
+def _build_filter(
+    *,
+    condition: str | None,
+    min_price: float | None,
+    max_price: float | None,
+    currency: str,
+) -> str | None:
+    """Build the eBay Browse API `filter` query-string value, or None if no filters."""
+    parts: list[str] = []
+    if condition:
+        parts.append(f"conditions:{{{condition}}}")
+    if min_price is not None or max_price is not None:
+        lo = f"{min_price:g}" if min_price is not None else ""
+        hi = f"{max_price:g}" if max_price is not None else ""
+        # Bracket range syntax: [lo..hi]
+        parts.append(f"price:[{lo}..{hi}]")
+        parts.append(f"priceCurrency:{currency}")
+    return ",".join(parts) if parts else None
+
+
+def _normalize_item_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project an eBay item-summary dict to a smaller LLM-facing shape."""
+    price = raw.get("price") or {}
+    seller = raw.get("seller") or {}
+    image = raw.get("image") or {}
+    out: dict[str, Any] = {
+        "item_id": raw.get("itemId", ""),
+        "title": raw.get("title", ""),
+        "price": float(price["value"]) if price.get("value") is not None else None,
+        "currency": price.get("currency"),
+        "condition": raw.get("condition"),
+        "seller": seller.get("username"),
+        "seller_feedback_score": seller.get("feedbackScore"),
+        "image_url": image.get("imageUrl"),
+        "ends_at": raw.get("itemEndDate"),
+        "buying_options": raw.get("buyingOptions", []),
+        "web_url": raw.get("itemWebUrl"),
+    }
+    # `bidCount` only present on auctions; surface when set.
+    if "bidCount" in raw:
+        out["bid_count"] = raw["bidCount"]
+    return out
+
+
+def _normalize_item_detail(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project a full Browse API item dict to the LLM shape; mostly a superset of summary."""
+    out = _normalize_item_summary(raw)
+    out["description"] = raw.get("shortDescription") or raw.get("description")
+    seller = raw.get("seller") or {}
+    if seller.get("feedbackPercentage") is not None:
+        out["seller_feedback_percentage"] = seller["feedbackPercentage"]
+    if "estimatedAvailabilities" in raw:
+        out["estimated_availabilities"] = raw["estimatedAvailabilities"]
+    if "shippingOptions" in raw:
+        out["shipping_options"] = raw["shippingOptions"]
+    if "returnTerms" in raw:
+        out["return_terms"] = raw["returnTerms"]
+    if "itemLocation" in raw:
+        out["item_location"] = raw["itemLocation"]
+    return out
+
+
+def _browse_get(
+    url: str, token: str, *, params: dict[str, Any] | None = None, marketplace: str = "EBAY_US"
+) -> httpx.Response:
+    """Issue a Browse API GET with the standard auth + marketplace headers."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": marketplace,
+        "Accept": "application/json",
+    }
+    return httpx.get(url, headers=headers, params=params, timeout=30)
+
+
+@mcp.tool()
+def search(
+    query: str,
+    category_id: str | None = None,
+    condition: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    currency: str = "USD",
+    sort: str = "best_match",
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    offset: int = 0,
+    marketplace: str = "EBAY_US",
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Search eBay items via the Browse API.
+
+    Args:
+        query: keyword search string. Required.
+        category_id: numeric eBay category ID to restrict the search.
+        condition: one of NEW, LIKE_NEW, NEW_OTHER, USED_EXCELLENT,
+            USED_VERY_GOOD, USED_GOOD, USED_ACCEPTABLE, FOR_PARTS_OR_NOT_WORKING,
+            MANUFACTURER_REFURBISHED, CERTIFIED_REFURBISHED, or several other
+            refurbished tiers. Case-sensitive.
+        min_price: minimum item price (in `currency`).
+        max_price: maximum item price (in `currency`).
+        currency: ISO currency code for the price filter (default "USD").
+        sort: one of "best_match" (default), "price_asc", "price_desc",
+            "newly_listed", "ending_soonest".
+        limit: number of hits per page. Default 20, hard cap 200.
+        offset: pagination offset.
+        marketplace: eBay marketplace ID (default "EBAY_US"). Other examples:
+            "EBAY_GB", "EBAY_DE", "EBAY_IT".
+        host: which configured host to use ("sandbox" or "production"). If
+            omitted, uses the config's `default_host`.
+
+    Returns:
+        dict with:
+          - host: which host was actually targeted
+          - total: total matching items per eBay
+          - limit, offset, next_offset (None when there's no next page)
+          - hits: list of item summaries (item_id, title, price, currency,
+            condition, seller, image_url, ends_at, buying_options, web_url,
+            bid_count if applicable)
+    """
+    if not query or not query.strip():
+        raise ValueError("query is required and must be non-empty")
+    if limit < 1 or limit > SEARCH_LIMIT_MAX:
+        raise ValueError(f"limit must be between 1 and {SEARCH_LIMIT_MAX}")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if sort not in _SORT_MAP:
+        raise ValueError(f"sort must be one of {sorted(_SORT_MAP)}; got {sort!r}")
+    if condition is not None and condition not in VALID_CONDITIONS:
+        raise ValueError(f"condition must be one of {sorted(VALID_CONDITIONS)}; got {condition!r}")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    token = get_app_token(cfg, resolved_host)
+    urls = urls_for_host(resolved_host)
+
+    params: dict[str, Any] = {"q": query, "limit": limit, "offset": offset}
+    if category_id:
+        params["category_ids"] = category_id
+    filt = _build_filter(
+        condition=condition, min_price=min_price, max_price=max_price, currency=currency
+    )
+    if filt:
+        params["filter"] = filt
+    if _SORT_MAP[sort]:
+        params["sort"] = _SORT_MAP[sort]
+
+    response = _browse_get(
+        f"{urls['browse']}/item_summary/search",
+        token,
+        params=params,
+        marketplace=marketplace,
+    )
+    response.raise_for_status()
+    body = response.json()
+
+    total = int(body.get("total", 0))
+    hits = [_normalize_item_summary(it) for it in body.get("itemSummaries", [])]
+    next_offset = offset + limit if offset + limit < total else None
+
+    return {
+        "host": resolved_host,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "hits": hits,
+    }
+
+
+@mcp.tool()
+def get_item(item_id: str, marketplace: str = "EBAY_US", host: str | None = None) -> dict[str, Any]:
+    """Fetch full details for a single eBay item by ID.
+
+    Args:
+        item_id: the eBay item ID (e.g., "v1|353528728623|0"). Get these from
+            search() results.
+        marketplace: eBay marketplace ID (default "EBAY_US").
+        host: which configured host to use. Defaults to config's `default_host`.
+
+    Returns:
+        Full item dict including description, shipping options, seller details,
+        return terms, item location, and the standard summary fields.
+        If the item doesn't exist or has ended, returns
+        {"item_id": item_id, "host": host, "missing": true}.
+    """
+    if not item_id or not item_id.strip():
+        raise ValueError("item_id is required and must be non-empty")
+
+    cfg = _config()
+    resolved_host = cfg.resolve_host(host)
+    token = get_app_token(cfg, resolved_host)
+    urls = urls_for_host(resolved_host)
+
+    response = _browse_get(
+        f"{urls['browse']}/item/{item_id}",
+        token,
+        marketplace=marketplace,
+    )
+    if response.status_code == 404:
+        return {"item_id": item_id, "host": resolved_host, "missing": True}
+    response.raise_for_status()
+    body = response.json()
+    out = _normalize_item_detail(body)
+    out["host"] = resolved_host
     return out
 
 

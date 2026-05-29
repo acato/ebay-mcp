@@ -1,6 +1,6 @@
 [project]
 name = "ebay-mcp"
-version = "0.0.0"
+version = "0.1.0"
 description = "MCP server for searching, bidding, buying, and managing watchlist + MyeBay on eBay (Browse API + Trading API hybrid)"
 readme = "README.md"
 license = { file = "LICENSE" }
