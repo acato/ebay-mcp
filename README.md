@@ -2,7 +2,7 @@
 
 MCP server for eBay buyer-side workflows: search, watch, bid, buy, manage MyeBay. Hybrid stack — modern Buy/Browse REST API for search and item lookup, legacy Trading API (still functional in 2026) for everything stateful.
 
-> ⚠️ **Beta (v0.4.1).** Browse + Trading APIs wired, sandbox + production both supported. Money-commit tools live behind safety gates AND an OS-modal Yes/No confirm dialog on every call — read the [money commits](#money-commits-high-risk--safety-gated) section before enabling production.
+> ⚠️ **Beta (v0.5.0).** Browse + Trading APIs wired, sandbox + production both supported. All 15 tools are production live-verified — including the three money-commit tools which have been used to close real eBay transactions through the safety stack (confirm-amount gate + $500 cap + OS-modal Yes/No dialog). Read the [money commits](#money-commits-high-risk--safety-gated) section before enabling production.
 
 ## Scope
 

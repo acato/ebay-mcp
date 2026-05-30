@@ -237,10 +237,11 @@ Refusal vs error split: anything the LLM can fix by changing inputs is refusal. 
 - **v0.1.x (Alpha):** + client_credentials OAuth + `search` / `get_item` (Browse API)
 - **v0.2.x (Alpha):** + user authorization-code flow + `get_watchlist` / `get_active_bids` / `get_won_items` / `get_lost_items` / `get_purchase_history`
 - **v0.3.0 (Beta, 2026-05-28):** + `add_to_watchlist` / `remove_from_watchlist`. Production OAuth wired and live-verified.
-- **v0.4.0 (Beta, 2026-05-29):** + `place_bid` / `buy_now` / `make_best_offer` with confirm-amount + $500 cap + override safety stack. Unit-tested; sandbox + production live verification deferred until after first real intended bid.
+- **v0.4.0 (Beta, 2026-05-29):** + `place_bid` / `buy_now` / `make_best_offer` with confirm-amount + $500 cap + override safety stack. Unit-tested.
 - **v0.4.1 (Beta, 2026-05-29):** + interactive OS-modal confirm dialog before every money commit on every host. No env-var bypass; tests stub `_show_modal_confirm` directly.
-- **v0.5.x (Beta):** + production smoke, README polish, all CI workflows, PyPI publish
-- **v1.0.0:** trouble-free use in real shopping workflow for ≥3 weeks; promote `Development Status` to `5 - Production/Stable`.
+- **v0.5.0 (Beta, 2026-05-29):** **production live-verified.** Real transactions closed against production eBay through the full safety stack — confirm-amount gate, $500 cap, OS-modal dialog, all firing as designed. Promotion milestone: the three money tools graduate from "unit-tested" to "exercised on real money workflow".
+- **v0.6.x (Beta):** GitHub Actions test/release workflows, PyPI publish via Trusted Publisher OIDC, README cross-platform install notes.
+- **v1.0.0:** trouble-free use in real shopping workflow for ≥3 weeks past v0.5.0; promote `Development Status` to `5 - Production/Stable`.
 
 ## 12. Considered + skipped
 
